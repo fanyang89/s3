@@ -1,21 +1,14 @@
 //! chDB metadata layer.
 //!
-//! Wraps the raw FFI with safe Rust abstractions and provides CRUD operations
+//! Wraps chdb-rust abstractions and provides CRUD operations
 //! for `buckets` and `objects` tables.
 
-pub mod chdb_sys;
-
-use std::ffi::{CStr, CString};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
+use chdb_rust::{connection::Connection, format::OutputFormat};
 use chrono::{DateTime, Utc};
 use tracing::debug;
-
-use chdb_sys::{
-    ChdbConnection, chdb_close_conn, chdb_connect, chdb_destroy_query_result, chdb_query_n,
-    chdb_result_buffer, chdb_result_error, chdb_result_length,
-};
 
 // ---------------------------------------------------------------------------
 // Safe connection wrapper
@@ -26,77 +19,31 @@ use chdb_sys::{
 /// chDB allows a single connection per process; we protect it with a `Mutex`
 /// so that concurrent tokio tasks serialise through it.
 pub struct ChdbConn {
-    inner: Mutex<*mut ChdbConnection>,
+    inner: Mutex<Connection>,
 }
 
-// SAFETY: ChdbConnection is internally thread-safe per the chDB docs.
+// SAFETY: chdb_rust::Connection is internally thread-safe per the chDB docs.
 unsafe impl Send for ChdbConn {}
 unsafe impl Sync for ChdbConn {}
 
 impl ChdbConn {
     /// Open a persistent chDB database at `path`.
     pub fn open(path: &str) -> Result<Self> {
-        let path_arg = format!("--path={}", path);
-        let prog = CString::new("chdb").unwrap();
-        let path_cstr = CString::new(path_arg.as_str()).context("path contains null byte")?;
-
-        let argv: Vec<*const std::ffi::c_char> = vec![prog.as_ptr(), path_cstr.as_ptr()];
-
-        let conn_ptr = unsafe { chdb_connect(argv.len() as i32, argv.as_ptr()) };
-
-        if conn_ptr.is_null() {
-            bail!("chdb_connect returned NULL for path={}", path);
-        }
+        let conn = Connection::open_with_path(path).context("open chdb connection")?;
 
         Ok(Self {
-            inner: Mutex::new(conn_ptr),
+            inner: Mutex::new(conn),
         })
     }
 
     /// Execute a SQL statement; returns raw UTF-8 result bytes.
     pub fn exec(&self, sql: &str, format: &str) -> Result<Vec<u8>> {
         let guard = self.inner.lock().unwrap();
-        let conn: ChdbConnection = unsafe { **guard };
-
-        let sql_bytes = sql.as_bytes();
-        let fmt_bytes = format.as_bytes();
-
-        let result = unsafe {
-            chdb_query_n(
-                conn,
-                sql_bytes.as_ptr() as *const std::ffi::c_char,
-                sql_bytes.len(),
-                fmt_bytes.as_ptr() as *const std::ffi::c_char,
-                fmt_bytes.len(),
-            )
-        };
-
-        if result.is_null() {
-            bail!("chdb_query_n returned NULL");
-        }
-
-        // Check for error
-        let err_ptr = unsafe { chdb_result_error(result) };
-        if !err_ptr.is_null() {
-            let err_msg = unsafe { CStr::from_ptr(err_ptr) }
-                .to_string_lossy()
-                .into_owned();
-            unsafe { chdb_destroy_query_result(result) };
-            if !err_msg.is_empty() {
-                bail!("chDB query error: {}", err_msg);
-            }
-        }
-
-        let len = unsafe { chdb_result_length(result) };
-        let buf_ptr = unsafe { chdb_result_buffer(result) };
-
-        let data = if len > 0 && !buf_ptr.is_null() {
-            unsafe { std::slice::from_raw_parts(buf_ptr as *const u8, len) }.to_vec()
-        } else {
-            Vec::new()
-        };
-
-        unsafe { chdb_destroy_query_result(result) };
+        let output_format = output_format_from_str(format);
+        let result = guard
+            .query(sql, output_format)
+            .context("chdb query failed")?;
+        let data = result.data_ref().to_vec();
 
         debug!(sql = %sql, result_bytes = data.len(), "chdb exec");
         Ok(data)
@@ -112,13 +59,6 @@ impl ChdbConn {
     pub fn query_str(&self, sql: &str, format: &str) -> Result<String> {
         let bytes = self.exec(sql, format)?;
         String::from_utf8(bytes).context("chDB result is not valid UTF-8")
-    }
-}
-
-impl Drop for ChdbConn {
-    fn drop(&mut self) {
-        let guard = self.inner.lock().unwrap();
-        unsafe { chdb_close_conn(*guard) };
     }
 }
 
@@ -397,6 +337,13 @@ fn parse_datetime64(s: &str) -> DateTime<Utc> {
     Utc::now()
 }
 
+fn output_format_from_str(format: &str) -> OutputFormat {
+    match format {
+        "JSONEachRow" => OutputFormat::JSONEachRow,
+        _ => OutputFormat::TabSeparated,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -450,6 +397,22 @@ mod tests {
         let dt = parse_datetime64("not-a-date");
         let after = Utc::now();
         assert!(dt >= before && dt <= after);
+    }
+
+    #[test]
+    fn output_format_json_each_row() {
+        assert!(matches!(
+            output_format_from_str("JSONEachRow"),
+            OutputFormat::JSONEachRow
+        ));
+    }
+
+    #[test]
+    fn output_format_default_tab_separated() {
+        assert!(matches!(
+            output_format_from_str("UnknownFormat"),
+            OutputFormat::TabSeparated
+        ));
     }
 
     // --- parse_object_meta ---
