@@ -46,3 +46,94 @@ jobs:
 
       - name: Run unit tests
         run: cargo test --bin s3-server
+
+  s3-tests:
+    name: S3 Compatibility Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install libchdb
+        run: |
+          curl -L https://github.com/chdb-io/chdb/releases/latest/download/linux-x86_64-libchdb.tar.gz \
+            | sudo tar -xz -C /usr/local/lib
+          sudo ldconfig
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Run ceph/s3-tests smoke test
+        run: |
+          git clone --depth 1 https://github.com/ceph/s3-tests.git /tmp/s3-tests
+          python -m pip install --upgrade pip
+          python -m pip install -r /tmp/s3-tests/requirements.txt
+          cat > /tmp/s3-tests.conf <<'EOF'
+          [DEFAULT]
+          host = 127.0.0.1
+          port = 9000
+          is_secure = False
+          ssl_verify = False
+
+          [fixtures]
+          bucket prefix = ci-{random}-
+
+          [s3 main]
+          display_name = ci-main
+          user_id = ci-main
+          email = ci-main@example.com
+          access_key = test
+          secret_key = testtest
+
+          [s3 alt]
+          display_name = ci-alt
+          user_id = ci-alt
+          email = ci-alt@example.com
+          access_key = test
+          secret_key = testtest
+
+          [s3 tenant]
+          display_name = ci-tenant
+          user_id = tenant$user
+          tenant = tenant
+          email = ci-tenant@example.com
+          access_key = test
+          secret_key = testtest
+
+          [iam]
+          access_key = test
+          secret_key = testtest
+          display_name = ci-iam
+          user_id = ci-iam
+          email = ci-iam@example.com
+
+          [iam root]
+          access_key = test
+          secret_key = testtest
+          user_id = ci-iam-root
+          email = ci-iam-root@example.com
+
+          [iam alt root]
+          access_key = test
+          secret_key = testtest
+          user_id = ci-iam-alt-root
+          email = ci-iam-alt-root@example.com
+          EOF
+
+          cargo run --bin s3-server -- config.toml >/tmp/s3-server.log 2>&1 &
+          SERVER_PID=$!
+          trap "kill $SERVER_PID" EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9000 >/dev/null 2>&1 || curl -fsSI http://127.0.0.1:9000 >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+
+          S3TEST_CONF=/tmp/s3tests.conf \
+            pytest -q /tmp/s3-tests/s3tests/functional/test_s3.py::test_object_write_to_nonexist_bucket
