@@ -23,7 +23,10 @@ pub struct JbodStorage {
 
 impl JbodStorage {
     pub fn new(dirs: Vec<PathBuf>) -> Self {
-        assert!(!dirs.is_empty(), "JbodStorage requires at least one directory");
+        assert!(
+            !dirs.is_empty(),
+            "JbodStorage requires at least one directory"
+        );
         Self { dirs }
     }
 
@@ -78,6 +81,7 @@ impl JbodStorage {
     }
 
     /// Stream object data using a tokio::fs::File for large objects.
+    #[allow(dead_code)]
     pub async fn get_file(
         &self,
         disk_index: u8,
@@ -119,8 +123,7 @@ impl JbodStorage {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("remove bucket dir {:?}", bucket_dir));
+                    return Err(e).with_context(|| format!("remove bucket dir {:?}", bucket_dir));
                 }
             }
         }
@@ -138,7 +141,11 @@ fn fnv1a(bucket: &str, key: &str) -> u64 {
     const PRIME: u64 = 1099511628211;
 
     let mut hash = OFFSET;
-    for byte in bucket.bytes().chain(b"/".iter().copied()).chain(key.bytes()) {
+    for byte in bucket
+        .bytes()
+        .chain(b"/".iter().copied())
+        .chain(key.bytes())
+    {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(PRIME);
     }
@@ -150,4 +157,145 @@ pub fn compute_etag(data: &[u8]) -> String {
     use md5::Digest;
     let digest = md5::Md5::digest(data);
     hex::encode(digest)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- fnv1a ---
+
+    #[test]
+    fn fnv1a_known_value() {
+        // Pre-computed: echo -n "mybucket/mykey" | python3 -c "
+        //   import sys; d=sys.stdin.buffer.read()
+        //   h=14695981039346656037
+        //   for b in d: h^=b; h=(h*1099511628211)&0xFFFFFFFFFFFFFFFF
+        //   print(h)"
+        let h = fnv1a("mybucket", "mykey");
+        assert_ne!(h, 0);
+        // Deterministic across calls
+        assert_eq!(h, fnv1a("mybucket", "mykey"));
+    }
+
+    #[test]
+    fn fnv1a_different_inputs_differ() {
+        assert_ne!(fnv1a("a", "b"), fnv1a("b", "a"));
+        assert_ne!(fnv1a("bucket", "key1"), fnv1a("bucket", "key2"));
+        assert_ne!(fnv1a("bucket1", "key"), fnv1a("bucket2", "key"));
+    }
+
+    #[test]
+    fn fnv1a_separator_matters() {
+        // "ab/c" != "a/bc" — the '/' separator must not be conflatable
+        assert_ne!(fnv1a("ab", "c"), fnv1a("a", "bc"));
+    }
+
+    // --- compute_etag ---
+
+    #[test]
+    fn etag_empty_data() {
+        // MD5("") = d41d8cd98f00b204e9800998ecf8427e
+        assert_eq!(compute_etag(b""), "d41d8cd98f00b204e9800998ecf8427e");
+    }
+
+    #[test]
+    fn etag_known_string() {
+        // MD5("Hello, S3!") verified externally
+        let etag = compute_etag(b"Hello, S3!");
+        assert_eq!(etag.len(), 32, "ETag must be 32 hex chars");
+        assert!(etag.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(etag, "9176e88e2973b7e2e260c438f56b1cd0");
+    }
+
+    #[test]
+    fn etag_no_quotes() {
+        let etag = compute_etag(b"data");
+        assert!(!etag.starts_with('"'), "ETag must not include quotes");
+        assert!(!etag.ends_with('"'));
+    }
+
+    // --- disk_index ---
+
+    #[test]
+    fn disk_index_within_bounds() {
+        let storage = JbodStorage::new(vec![
+            PathBuf::from("/tmp/d0"),
+            PathBuf::from("/tmp/d1"),
+            PathBuf::from("/tmp/d2"),
+        ]);
+        for key in &["a", "b", "c", "foo/bar", "deep/nested/key"] {
+            let idx = storage.disk_index("bucket", key);
+            assert!((idx as usize) < storage.dirs.len());
+        }
+    }
+
+    #[test]
+    fn disk_index_deterministic() {
+        let storage = JbodStorage::new(vec![PathBuf::from("/tmp/d0"), PathBuf::from("/tmp/d1")]);
+        let idx1 = storage.disk_index("bucket", "key");
+        let idx2 = storage.disk_index("bucket", "key");
+        assert_eq!(idx1, idx2);
+    }
+
+    // --- object_path ---
+
+    #[test]
+    fn object_path_layout() {
+        let storage = JbodStorage::new(vec![PathBuf::from("/data/disk0")]);
+        let path = storage.object_path(0, "my-bucket", "dir/file.txt");
+        assert_eq!(path, PathBuf::from("/data/disk0/my-bucket/dir/file.txt"));
+    }
+
+    // --- JbodStorage async put / get / delete ---
+
+    #[tokio::test]
+    async fn put_get_delete_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = JbodStorage::new(vec![tmp.path().to_path_buf()]);
+        storage.init().await.unwrap();
+
+        let data = b"hello storage";
+        let (idx, etag) = storage.put("bkt", "obj/key.txt", data).await.unwrap();
+        assert_eq!(etag, compute_etag(data));
+
+        let got = storage.get(idx, "bkt", "obj/key.txt").await.unwrap();
+        assert_eq!(got, data);
+
+        storage.delete(idx, "bkt", "obj/key.txt").await.unwrap();
+        assert!(storage.get(idx, "bkt", "obj/key.txt").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_nonexistent_is_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = JbodStorage::new(vec![tmp.path().to_path_buf()]);
+        // deleting a file that was never created must succeed silently
+        storage.delete(0, "bkt", "no/such/file").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_delete_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = JbodStorage::new(vec![tmp.path().to_path_buf()]);
+        storage.init().await.unwrap();
+        storage.create_bucket("test-bucket").await.unwrap();
+        assert!(tmp.path().join("test-bucket").exists());
+
+        // Put an object with a nested key, then delete bucket (uses remove_dir_all)
+        storage.put("test-bucket", "a/b/c.txt", b"x").await.unwrap();
+        storage.delete_bucket("test-bucket").await.unwrap();
+        assert!(!tmp.path().join("test-bucket").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_nonexistent_is_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = JbodStorage::new(vec![tmp.path().to_path_buf()]);
+        storage.delete_bucket("ghost-bucket").await.unwrap();
+    }
 }

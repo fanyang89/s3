@@ -29,6 +29,7 @@ pub type ChdbConnection = *mut ChdbConnectionInner;
 // ---------------------------------------------------------------------------
 
 #[link(name = "chdb")]
+#[allow(dead_code)]
 unsafe extern "C" {
     /// Open a chDB connection.
     /// argv may include `--path=<db_path>` to persist to disk; omit for `:memory:`.

@@ -8,13 +8,13 @@ pub mod chdb_sys;
 use std::ffi::{CStr, CString};
 use std::sync::Mutex;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use tracing::debug;
 
 use chdb_sys::{
-    chdb_close_conn, chdb_connect, chdb_destroy_query_result, chdb_query_n, chdb_result_buffer,
-    chdb_result_error, chdb_result_length, ChdbConnection,
+    ChdbConnection, chdb_close_conn, chdb_connect, chdb_destroy_query_result, chdb_query_n,
+    chdb_result_buffer, chdb_result_error, chdb_result_length,
 };
 
 // ---------------------------------------------------------------------------
@@ -237,7 +237,8 @@ pub fn bucket_delete(conn: &ChdbConn, name: &str) -> Result<()> {
     let count_sql = format!(
         "SELECT count() FROM meta.objects FINAL WHERE bucket = '{}' \
          AND (bucket, key) NOT IN (SELECT bucket, key FROM meta.deleted_objects WHERE bucket = '{}')",
-        esc(name), esc(name)
+        esc(name),
+        esc(name)
     );
     let result = conn.query_str(&count_sql, "TabSeparated")?;
     let count: u64 = result.trim().parse().context("parse object count")?;
@@ -394,4 +395,81 @@ fn parse_datetime64(s: &str) -> DateTime<Utc> {
         }
     }
     Utc::now()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- esc ---
+
+    #[test]
+    fn esc_plain_string() {
+        assert_eq!(esc("hello"), "hello");
+    }
+
+    #[test]
+    fn esc_single_quote() {
+        assert_eq!(esc("it's"), "it\\'s");
+    }
+
+    #[test]
+    fn esc_backslash() {
+        assert_eq!(esc("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn esc_combined() {
+        assert_eq!(esc("a\\'b"), "a\\\\\\'b");
+    }
+
+    // --- parse_datetime64 ---
+
+    #[test]
+    fn parse_datetime64_space_format() {
+        let dt = parse_datetime64("2024-01-15 12:34:56.789");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2024-01-15 12:34:56"
+        );
+    }
+
+    #[test]
+    fn parse_datetime64_no_millis() {
+        let dt = parse_datetime64("2024-06-01 00:00:00");
+        assert_eq!(dt.format("%Y-%m-%d").to_string(), "2024-06-01");
+    }
+
+    #[test]
+    fn parse_datetime64_invalid_falls_back_to_now() {
+        let before = Utc::now();
+        let dt = parse_datetime64("not-a-date");
+        let after = Utc::now();
+        assert!(dt >= before && dt <= after);
+    }
+
+    // --- parse_object_meta ---
+
+    #[test]
+    fn parse_object_meta_valid() {
+        let json = r#"{"bucket":"b","key":"k","disk_index":1,"size":42,"etag":"abc","content_type":"text/plain","last_modified":"2024-01-01 00:00:00"}"#;
+        let meta = parse_object_meta(json).unwrap();
+        assert_eq!(meta.bucket, "b");
+        assert_eq!(meta.key, "k");
+        assert_eq!(meta.disk_index, 1);
+        assert_eq!(meta.size, 42);
+        assert_eq!(meta.etag, "abc");
+        assert_eq!(meta.content_type, "text/plain");
+    }
+
+    #[test]
+    fn parse_object_meta_missing_content_type_defaults() {
+        let json = r#"{"bucket":"b","key":"k","disk_index":0,"size":0,"etag":"","last_modified":"2024-01-01 00:00:00"}"#;
+        let meta = parse_object_meta(json).unwrap();
+        assert_eq!(meta.content_type, "application/octet-stream");
+    }
 }

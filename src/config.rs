@@ -17,7 +17,7 @@
 //! path = "/data/disk2"
 //! ```
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -99,5 +99,76 @@ impl Config {
             bail!("At least one [[directories]] entry is required");
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_dev_is_valid() {
+        let cfg = Config::default_dev();
+        assert_eq!(cfg.server.host, "0.0.0.0");
+        assert_eq!(cfg.server.port, 9000);
+        assert!(!cfg.directories.is_empty());
+    }
+
+    #[test]
+    fn parse_minimal_toml() {
+        let toml = r#"
+[[directories]]
+path = "/data/disk0"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.server.host, "0.0.0.0");
+        assert_eq!(cfg.server.port, 9000);
+        assert_eq!(cfg.directories.len(), 1);
+        assert_eq!(cfg.directories[0].path, "/data/disk0");
+    }
+
+    #[test]
+    fn parse_full_toml() {
+        let toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[metadata]
+path = "/var/meta"
+
+[[directories]]
+path = "/data/disk0"
+
+[[directories]]
+path = "/data/disk1"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.server.host, "127.0.0.1");
+        assert_eq!(cfg.server.port, 8080);
+        assert_eq!(cfg.metadata.path, "/var/meta");
+        assert_eq!(cfg.directories.len(), 2);
+    }
+
+    #[test]
+    fn validate_rejects_empty_directories() {
+        let cfg = Config {
+            server: ServerConfig::default(),
+            metadata: MetadataConfig::default(),
+            directories: vec![],
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn from_file_nonexistent_returns_error() {
+        let result = Config::from_file("/nonexistent/path/config.toml");
+        assert!(result.is_err());
     }
 }

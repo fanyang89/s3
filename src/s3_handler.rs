@@ -13,8 +13,8 @@ use s3s::{S3Request, S3Response, S3Result, s3_error};
 use tracing::{error, info};
 
 use crate::metadata::{
-    BucketMeta, ChdbConn, ObjectMeta, bucket_create, bucket_delete, bucket_exists,
-    bucket_list, object_delete, object_get, object_list, object_put,
+    BucketMeta, ChdbConn, ObjectMeta, bucket_create, bucket_delete, bucket_exists, bucket_list,
+    object_delete, object_get, object_list, object_put,
 };
 use crate::storage::JbodStorage;
 
@@ -114,14 +114,13 @@ impl s3s::S3 for StorageHandler {
             return Err(s3_error!(NoSuchBucket, "bucket {bucket} does not exist"));
         }
 
-        bucket_delete(&self.db, bucket)
-            .map_err(|e| {
-                if e.to_string().contains("BucketNotEmpty") {
-                    s3_error!(BucketNotEmpty, "bucket {bucket} is not empty")
-                } else {
-                    s3_error!(InternalError, "metadata error: {e}")
-                }
-            })?;
+        bucket_delete(&self.db, bucket).map_err(|e| {
+            if e.to_string().contains("BucketNotEmpty") {
+                s3_error!(BucketNotEmpty, "bucket {bucket} is not empty")
+            } else {
+                s3_error!(InternalError, "metadata error: {e}")
+            }
+        })?;
 
         self.storage
             .delete_bucket(bucket)
@@ -137,8 +136,8 @@ impl s3s::S3 for StorageHandler {
     ) -> S3Result<S3Response<ListBucketsOutput>> {
         info!("ListBuckets");
 
-        let metas: Vec<BucketMeta> = bucket_list(&self.db)
-            .map_err(|e| s3_error!(InternalError, "metadata error: {e}"))?;
+        let metas: Vec<BucketMeta> =
+            bucket_list(&self.db).map_err(|e| s3_error!(InternalError, "metadata error: {e}"))?;
 
         let buckets: Vec<Bucket> = metas
             .into_iter()
@@ -199,8 +198,7 @@ impl s3s::S3 for StorageHandler {
             content_type,
             last_modified: chrono::Utc::now(),
         };
-        object_put(&self.db, &meta)
-            .map_err(|e| s3_error!(InternalError, "metadata error: {e}"))?;
+        object_put(&self.db, &meta).map_err(|e| s3_error!(InternalError, "metadata error: {e}"))?;
 
         let output = PutObjectOutput {
             e_tag: Some(wrap_etag(&etag)),
@@ -309,9 +307,8 @@ impl s3s::S3 for StorageHandler {
             return Err(s3_error!(NoSuchBucket, "bucket {bucket} does not exist"));
         }
 
-        let (objects, is_truncated) =
-            object_list(&self.db, bucket, prefix, max_keys, marker)
-                .map_err(|e| s3_error!(InternalError, "metadata error: {e}"))?;
+        let (objects, is_truncated) = object_list(&self.db, bucket, prefix, max_keys, marker)
+            .map_err(|e| s3_error!(InternalError, "metadata error: {e}"))?;
 
         let last_key = objects.last().map(|o| o.key.clone());
 
@@ -336,8 +333,12 @@ impl s3s::S3 for StorageHandler {
             marker: req.input.marker,
             max_keys: Some(max_keys as i32),
             is_truncated: Some(is_truncated),
-            contents: if contents.is_empty() { None } else { Some(contents) },
-            next_marker: if is_truncated { last_key.map(|k| k.into()) } else { None },
+            contents: if contents.is_empty() {
+                None
+            } else {
+                Some(contents)
+            },
+            next_marker: if is_truncated { last_key } else { None },
             delimiter: req.input.delimiter,
             common_prefixes: None,
             encoding_type: None,
@@ -362,9 +363,8 @@ impl s3s::S3 for StorageHandler {
             return Err(s3_error!(NoSuchBucket, "bucket {bucket} does not exist"));
         }
 
-        let (objects, is_truncated) =
-            object_list(&self.db, bucket, prefix, max_keys, continuation)
-                .map_err(|e| s3_error!(InternalError, "metadata error: {e}"))?;
+        let (objects, is_truncated) = object_list(&self.db, bucket, prefix, max_keys, continuation)
+            .map_err(|e| s3_error!(InternalError, "metadata error: {e}"))?;
 
         let last_key = objects.last().map(|o| o.key.clone());
         let key_count = objects.len() as i32;
@@ -390,12 +390,12 @@ impl s3s::S3 for StorageHandler {
             max_keys: Some(max_keys as i32),
             key_count: Some(key_count),
             is_truncated: Some(is_truncated),
-            contents: if contents.is_empty() { None } else { Some(contents) },
-            next_continuation_token: if is_truncated {
-                last_key.map(|k| k.into())
-            } else {
+            contents: if contents.is_empty() {
                 None
+            } else {
+                Some(contents)
             },
+            next_continuation_token: if is_truncated { last_key } else { None },
             continuation_token: req.input.continuation_token,
             delimiter: req.input.delimiter,
             common_prefixes: None,
