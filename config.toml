@@ -1,0 +1,12 @@
+[server]
+host = "0.0.0.0"
+port = 9000
+
+[metadata]
+path = "/tmp/s3-meta"
+
+[[directories]]
+path = "/tmp/s3-data0"
+
+[[directories]]
+path = "/tmp/s3-data1"
