@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -128,12 +131,18 @@ jobs:
           cargo run --bin s3-server -- config.toml >/tmp/s3-server.log 2>&1 &
           SERVER_PID=$!
           trap "kill $SERVER_PID" EXIT
+          READY=0
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:9000 >/dev/null 2>&1 || curl -fsSI http://127.0.0.1:9000 >/dev/null 2>&1; then
+            if curl -sS -o /dev/null http://127.0.0.1:9000; then
+              READY=1
               break
             fi
             sleep 1
           done
+          if [ "$READY" -ne 1 ]; then
+            cat /tmp/s3-server.log
+            exit 1
+          fi
 
-          S3TEST_CONF=/tmp/s3tests.conf \
+          S3TEST_CONF=/tmp/s3-tests.conf \
             pytest -q /tmp/s3-tests/s3tests/functional/test_s3.py::test_object_write_to_nonexist_bucket
