@@ -39,10 +39,8 @@ impl ChdbConn {
     /// Execute a SQL statement; returns raw UTF-8 result bytes.
     pub fn exec(&self, sql: &str, format: &str) -> Result<Vec<u8>> {
         let guard = self.inner.lock().unwrap();
-        let output_format = output_format_from_str(format);
-        let result = guard
-            .query(sql, output_format)
-            .context("chdb query failed")?;
+        let output_fmt = output_format_from_str(format)?;
+        let result = guard.query(sql, output_fmt).context("chdb query failed")?;
         let data = result.data_ref().to_vec();
 
         debug!(sql = %sql, result_bytes = data.len(), "chdb exec");
@@ -337,10 +335,15 @@ fn parse_datetime64(s: &str) -> DateTime<Utc> {
     Utc::now()
 }
 
-fn output_format_from_str(format: &str) -> OutputFormat {
+/// Translate configured format strings to chdb-rust output formats.
+///
+/// Supported values are `"JSONEachRow"` and `"TabSeparated"`.
+/// Any other format string returns an error to avoid silently changing behavior.
+fn output_format_from_str(format: &str) -> Result<OutputFormat> {
     match format {
-        "JSONEachRow" => OutputFormat::JSONEachRow,
-        _ => OutputFormat::TabSeparated,
+        "JSONEachRow" => Ok(OutputFormat::JSONEachRow),
+        "TabSeparated" => Ok(OutputFormat::TabSeparated),
+        _ => bail!("unsupported output format: {format}"),
     }
 }
 
@@ -402,17 +405,22 @@ mod tests {
     #[test]
     fn output_format_json_each_row() {
         assert!(matches!(
-            output_format_from_str("JSONEachRow"),
+            output_format_from_str("JSONEachRow").unwrap(),
             OutputFormat::JSONEachRow
         ));
     }
 
     #[test]
-    fn output_format_default_tab_separated() {
+    fn output_format_tab_separated() {
         assert!(matches!(
-            output_format_from_str("UnknownFormat"),
+            output_format_from_str("TabSeparated").unwrap(),
             OutputFormat::TabSeparated
         ));
+    }
+
+    #[test]
+    fn output_format_unknown_rejected() {
+        assert!(output_format_from_str("UnknownFormat").is_err());
     }
 
     // --- parse_object_meta ---
