@@ -3,17 +3,18 @@
 //! Implements the `s3s::S3` trait by delegating to our JBOD storage engine
 //! (for data I/O) and chDB metadata layer (for bucket/object metadata).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use chdb_rust::connection::Connection;
 use futures::TryStreamExt;
 use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result, s3_error};
 use tracing::{error, info};
 
 use crate::metadata::{
-    BucketMeta, ChdbConn, ObjectMeta, bucket_create, bucket_delete, bucket_exists, bucket_list,
+    BucketMeta, ObjectMeta, bucket_create, bucket_delete, bucket_exists, bucket_list,
     object_delete, object_get, object_list, object_put,
 };
 use crate::storage::JbodStorage;
@@ -23,7 +24,7 @@ use crate::storage::JbodStorage;
 // ---------------------------------------------------------------------------
 
 pub struct StorageHandler {
-    pub db: Arc<ChdbConn>,
+    pub db: Arc<Mutex<Connection>>,
     pub storage: Arc<JbodStorage>,
 }
 

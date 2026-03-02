@@ -11,53 +11,27 @@ use chrono::{DateTime, Utc};
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
-// Safe connection wrapper
+// Connection helper functions
 // ---------------------------------------------------------------------------
 
-/// A thread-safe chDB connection.
-///
-/// chDB allows a single connection per process; we protect it with a `Mutex`
-/// so that concurrent tokio tasks serialise through it.
-pub struct ChdbConn {
-    inner: Mutex<Connection>,
+fn conn_exec(conn: &Mutex<Connection>, sql: &str, format: &str) -> Result<Vec<u8>> {
+    let guard = conn.lock().unwrap();
+    let output_fmt = output_format_from_str(format)?;
+    let result = guard.query(sql, output_fmt).context("chdb query failed")?;
+    let data = result.data_ref().to_vec();
+
+    debug!(sql = %sql, result_bytes = data.len(), "chdb exec");
+    Ok(data)
 }
 
-// SAFETY: chdb_rust::Connection is internally thread-safe per the chDB docs.
-unsafe impl Send for ChdbConn {}
-unsafe impl Sync for ChdbConn {}
+fn conn_execute(conn: &Mutex<Connection>, sql: &str) -> Result<()> {
+    conn_exec(conn, sql, "TabSeparated")?;
+    Ok(())
+}
 
-impl ChdbConn {
-    /// Open a persistent chDB database at `path`.
-    pub fn open(path: &str) -> Result<Self> {
-        let conn = Connection::open_with_path(path).context("open chdb connection")?;
-
-        Ok(Self {
-            inner: Mutex::new(conn),
-        })
-    }
-
-    /// Execute a SQL statement; returns raw UTF-8 result bytes.
-    pub fn exec(&self, sql: &str, format: &str) -> Result<Vec<u8>> {
-        let guard = self.inner.lock().unwrap();
-        let output_fmt = output_format_from_str(format)?;
-        let result = guard.query(sql, output_fmt).context("chdb query failed")?;
-        let data = result.data_ref().to_vec();
-
-        debug!(sql = %sql, result_bytes = data.len(), "chdb exec");
-        Ok(data)
-    }
-
-    /// Convenience: execute DDL / DML that returns no meaningful rows.
-    pub fn execute(&self, sql: &str) -> Result<()> {
-        self.exec(sql, "TabSeparated")?;
-        Ok(())
-    }
-
-    /// Convenience: execute a SELECT and return UTF-8 text result.
-    pub fn query_str(&self, sql: &str, format: &str) -> Result<String> {
-        let bytes = self.exec(sql, format)?;
-        String::from_utf8(bytes).context("chDB result is not valid UTF-8")
-    }
+fn conn_query_str(conn: &Mutex<Connection>, sql: &str, format: &str) -> Result<String> {
+    let bytes = conn_exec(conn, sql, format)?;
+    String::from_utf8(bytes).context("chDB result is not valid UTF-8")
 }
 
 // ---------------------------------------------------------------------------
@@ -95,11 +69,11 @@ CREATE TABLE IF NOT EXISTS meta.deleted_objects (
 ) ENGINE = MergeTree()
 ORDER BY (bucket, key)";
 
-pub fn init_schema(conn: &ChdbConn) -> Result<()> {
-    conn.execute(CREATE_DB)?;
-    conn.execute(CREATE_BUCKETS)?;
-    conn.execute(CREATE_OBJECTS)?;
-    conn.execute(CREATE_DELETED_OBJECTS)?;
+pub fn init_schema(conn: &Mutex<Connection>) -> Result<()> {
+    conn_execute(conn, CREATE_DB)?;
+    conn_execute(conn, CREATE_BUCKETS)?;
+    conn_execute(conn, CREATE_OBJECTS)?;
+    conn_execute(conn, CREATE_DELETED_OBJECTS)?;
     Ok(())
 }
 
@@ -133,27 +107,27 @@ fn esc(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
-pub fn bucket_create(conn: &ChdbConn, name: &str) -> Result<()> {
+pub fn bucket_create(conn: &Mutex<Connection>, name: &str) -> Result<()> {
     let sql = format!(
         "INSERT INTO meta.buckets (name, created_at) VALUES ('{}', now64(3))",
         esc(name)
     );
-    conn.execute(&sql)
+    conn_execute(conn, &sql)
 }
 
-pub fn bucket_exists(conn: &ChdbConn, name: &str) -> Result<bool> {
+pub fn bucket_exists(conn: &Mutex<Connection>, name: &str) -> Result<bool> {
     let sql = format!(
         "SELECT count() FROM meta.buckets WHERE name = '{}'",
         esc(name)
     );
-    let result = conn.query_str(&sql, "TabSeparated")?;
+    let result = conn_query_str(conn, &sql, "TabSeparated")?;
     let count: u64 = result.trim().parse().context("parse bucket count")?;
     Ok(count > 0)
 }
 
-pub fn bucket_list(conn: &ChdbConn) -> Result<Vec<BucketMeta>> {
+pub fn bucket_list(conn: &Mutex<Connection>) -> Result<Vec<BucketMeta>> {
     let sql = "SELECT name, created_at FROM meta.buckets ORDER BY name";
-    let result = conn.query_str(sql, "JSONEachRow")?;
+    let result = conn_query_str(conn, sql, "JSONEachRow")?;
     let mut buckets = Vec::new();
     for line in result.lines() {
         let line = line.trim();
@@ -170,7 +144,7 @@ pub fn bucket_list(conn: &ChdbConn) -> Result<Vec<BucketMeta>> {
     Ok(buckets)
 }
 
-pub fn bucket_delete(conn: &ChdbConn, name: &str) -> Result<()> {
+pub fn bucket_delete(conn: &Mutex<Connection>, name: &str) -> Result<()> {
     // First check if bucket is empty
     let count_sql = format!(
         "SELECT count() FROM meta.objects FINAL WHERE bucket = '{}' \
@@ -178,7 +152,7 @@ pub fn bucket_delete(conn: &ChdbConn, name: &str) -> Result<()> {
         esc(name),
         esc(name)
     );
-    let result = conn.query_str(&count_sql, "TabSeparated")?;
+    let result = conn_query_str(conn, &count_sql, "TabSeparated")?;
     let count: u64 = result.trim().parse().context("parse object count")?;
     if count > 0 {
         bail!("BucketNotEmpty");
@@ -188,21 +162,21 @@ pub fn bucket_delete(conn: &ChdbConn, name: &str) -> Result<()> {
         "ALTER TABLE meta.buckets DELETE WHERE name = '{}'",
         esc(name)
     );
-    conn.execute(&sql)
+    conn_execute(conn, &sql)
 }
 
 // ---------------------------------------------------------------------------
 // Object operations
 // ---------------------------------------------------------------------------
 
-pub fn object_put(conn: &ChdbConn, meta: &ObjectMeta) -> Result<()> {
+pub fn object_put(conn: &Mutex<Connection>, meta: &ObjectMeta) -> Result<()> {
     // Remove any pending delete entry first
     let del_sql = format!(
         "ALTER TABLE meta.deleted_objects DELETE WHERE bucket = '{}' AND key = '{}'",
         esc(&meta.bucket),
         esc(&meta.key)
     );
-    conn.execute(&del_sql)?;
+    conn_execute(conn, &del_sql)?;
 
     let sql = format!(
         "INSERT INTO meta.objects \
@@ -215,10 +189,10 @@ pub fn object_put(conn: &ChdbConn, meta: &ObjectMeta) -> Result<()> {
         esc(&meta.etag),
         esc(&meta.content_type),
     );
-    conn.execute(&sql)
+    conn_execute(conn, &sql)
 }
 
-pub fn object_get(conn: &ChdbConn, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
+pub fn object_get(conn: &Mutex<Connection>, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
     let sql = format!(
         "SELECT bucket, key, disk_index, size, etag, content_type, last_modified \
          FROM meta.objects FINAL \
@@ -231,7 +205,7 @@ pub fn object_get(conn: &ChdbConn, bucket: &str, key: &str) -> Result<Option<Obj
         esc(bucket),
         esc(key)
     );
-    let result = conn.query_str(&sql, "JSONEachRow")?;
+    let result = conn_query_str(conn, &sql, "JSONEachRow")?;
     let line = result.lines().find(|l| !l.trim().is_empty());
     match line {
         None => Ok(None),
@@ -239,18 +213,18 @@ pub fn object_get(conn: &ChdbConn, bucket: &str, key: &str) -> Result<Option<Obj
     }
 }
 
-pub fn object_delete(conn: &ChdbConn, bucket: &str, key: &str) -> Result<()> {
+pub fn object_delete(conn: &Mutex<Connection>, bucket: &str, key: &str) -> Result<()> {
     let sql = format!(
         "INSERT INTO meta.deleted_objects (bucket, key, deleted_at) \
          VALUES ('{}', '{}', now64(3))",
         esc(bucket),
         esc(key)
     );
-    conn.execute(&sql)
+    conn_execute(conn, &sql)
 }
 
 pub fn object_list(
-    conn: &ChdbConn,
+    conn: &Mutex<Connection>,
     bucket: &str,
     prefix: Option<&str>,
     max_keys: u32,
@@ -281,7 +255,7 @@ pub fn object_list(
         max_keys + 1
     );
 
-    let result = conn.query_str(&sql, "JSONEachRow")?;
+    let result = conn_query_str(conn, &sql, "JSONEachRow")?;
     let mut objects = Vec::new();
     for line in result.lines() {
         let line = line.trim();

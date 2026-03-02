@@ -5,9 +5,10 @@ mod storage;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use chdb_rust::connection::Connection;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3s::auth::SimpleAuth;
@@ -17,7 +18,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
-use crate::metadata::{ChdbConn, init_schema};
+use crate::metadata::init_schema;
 use crate::s3_handler::StorageHandler;
 use crate::storage::JbodStorage;
 
@@ -58,10 +59,9 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&cfg.metadata.path)
         .with_context(|| format!("create metadata dir {}", cfg.metadata.path))?;
 
-    let db = Arc::new(
-        ChdbConn::open(&cfg.metadata.path)
-            .with_context(|| format!("open chDB at {}", cfg.metadata.path))?,
-    );
+    let conn = Connection::open_with_path(&cfg.metadata.path)
+        .with_context(|| format!("open chDB at {}", cfg.metadata.path))?;
+    let db = Arc::new(Mutex::new(conn));
     init_schema(&db).context("init chDB schema")?;
     info!("chDB metadata store ready");
 
