@@ -15,9 +15,17 @@
 //!
 //! [[directories]]
 //! path = "/data/disk2"
+//!
+//! [[auth.credentials]]
+//! access_key = "AKIAIOSFODNN7EXAMPLE"
+//! secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+//!
+//! [[auth.credentials]]
+//! access_key = "test"
+//! secret_key = "testtest"
 //! ```
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +71,18 @@ pub struct DirectoryConfig {
     pub path: String,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct Credential {
+    pub access_key: String,
+    pub secret_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuthConfig {
+    #[serde(rename = "credentials")]
+    pub credentials: Vec<Credential>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -71,6 +91,7 @@ pub struct Config {
     pub metadata: MetadataConfig,
     #[serde(rename = "directories")]
     pub directories: Vec<DirectoryConfig>,
+    pub auth: AuthConfig,
 }
 
 impl Config {
@@ -91,12 +112,21 @@ impl Config {
             directories: vec![DirectoryConfig {
                 path: "/tmp/s3-data".to_string(),
             }],
+            auth: AuthConfig {
+                credentials: vec![Credential {
+                    access_key: "test".to_string(),
+                    secret_key: "testtest".to_string(),
+                }],
+            },
         }
     }
 
     fn validate(&self) -> Result<()> {
         if self.directories.is_empty() {
             bail!("At least one [[directories]] entry is required");
+        }
+        if self.auth.credentials.is_empty() {
+            bail!("At least one [[auth.credentials]] entry is required");
         }
         Ok(())
     }
@@ -123,6 +153,10 @@ mod tests {
         let toml = r#"
 [[directories]]
 path = "/data/disk0"
+
+[[auth.credentials]]
+access_key = "test"
+secret_key = "testtest"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         cfg.validate().unwrap();
@@ -147,6 +181,14 @@ path = "/data/disk0"
 
 [[directories]]
 path = "/data/disk1"
+
+[[auth.credentials]]
+access_key = "admin"
+secret_key = "password123"
+
+[[auth.credentials]]
+access_key = "backup"
+secret_key = "backup-secret"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         cfg.validate().unwrap();
@@ -154,6 +196,7 @@ path = "/data/disk1"
         assert_eq!(cfg.server.port, 8080);
         assert_eq!(cfg.metadata.path, "/var/meta");
         assert_eq!(cfg.directories.len(), 2);
+        assert_eq!(cfg.auth.credentials.len(), 2);
     }
 
     #[test]
@@ -162,6 +205,12 @@ path = "/data/disk1"
             server: ServerConfig::default(),
             metadata: MetadataConfig::default(),
             directories: vec![],
+            auth: AuthConfig {
+                credentials: vec![Credential {
+                    access_key: "test".to_string(),
+                    secret_key: "test".to_string(),
+                }],
+            },
         };
         assert!(cfg.validate().is_err());
     }

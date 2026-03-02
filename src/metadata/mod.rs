@@ -2,40 +2,335 @@
 //!
 //! Wraps chdb-rust abstractions and provides CRUD operations
 //! for `buckets` and `objects` tables.
+//!
+//! # Usage
+//!
+//! There are two ways to use this module:
+//!
+//! ## 1. Using MetaStore (Recommended)
+//!
+//! ```rust,ignore
+//! use std::sync::{Arc, Mutex};
+//! use chdb_rust::connection::Connection;
+//! use crate::metadata::MetaStore;
+//!
+//! // Create a connection
+//! let conn = Connection::open_with_path("/path/to/db")?;
+//! let conn = Arc::new(Mutex::new(conn));
+//!
+//! // Create MetaStore
+//! let store = MetaStore::new(conn);
+//!
+//! // Initialize schema
+//! store.init_schema()?;
+//!
+//! // Use the store
+//! store.bucket_create("my-bucket")?;
+//! let exists = store.bucket_exists("my-bucket")?;
+//! ```.
+//!
+//! ## 2. Using legacy functions (Backward compatible)
+//!
+//! ```rust,ignore
+//! use std::sync::{Arc, Mutex};
+//! use chdb_rust::connection::Connection;
+//! use crate::metadata::{init_schema, bucket_create, bucket_exists};
+//!
+//! let conn = Connection::open_with_path("/path/to/db")?;
+//! let db = Arc::new(Mutex::new(conn));
+//!
+//! init_schema(&db)?;
+//! bucket_create(&db, "my-bucket")?;
+//! let exists = bucket_exists(&db, "my-bucket")?;
+//! ```
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chdb_rust::{connection::Connection, format::OutputFormat};
 use chrono::{DateTime, Utc};
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
-// Connection helper functions
+// MetaStore - Main metadata store wrapper
 // ---------------------------------------------------------------------------
 
-fn conn_exec(conn: &Mutex<Connection>, sql: &str, format: &str) -> Result<Vec<u8>> {
-    let guard = conn.lock().unwrap();
-    let output_fmt = output_format_from_str(format)?;
-    let result = guard.query(sql, output_fmt).context("chdb query failed")?;
-    let data = result.data_ref().to_vec();
-
-    debug!(sql = %sql, result_bytes = data.len(), "chdb exec");
-    Ok(data)
+/// Metadata store wrapper for chDB connection.
+///
+/// Provides a clean object-oriented interface for metadata operations.
+/// Wraps an `Arc<Mutex<Connection>>` and provides methods for bucket
+/// and object management.
+pub struct MetaStore {
+    conn: Arc<Mutex<Connection>>,
 }
 
-fn conn_execute(conn: &Mutex<Connection>, sql: &str) -> Result<()> {
-    conn_exec(conn, sql, "TabSeparated")?;
-    Ok(())
-}
+impl MetaStore {
+    /// Create a new MetaStore instance.
+    ///
+    /// # Arguments
+    ///
+    /// * `conn` - An Arc-wrapped Mutex containing the chDB Connection
+    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
+    }
 
-fn conn_query_str(conn: &Mutex<Connection>, sql: &str, format: &str) -> Result<String> {
-    let bytes = conn_exec(conn, sql, format)?;
-    String::from_utf8(bytes).context("chDB result is not valid UTF-8")
+    /// Initialize the database schema.
+    ///
+    /// Creates the necessary tables (buckets, objects, deleted_objects)
+    /// if they don't already exist.
+    pub fn init_schema(&self) -> Result<()> {
+        self.execute(CREATE_DB)?;
+        self.execute(CREATE_BUCKETS)?;
+        self.execute(CREATE_OBJECTS)?;
+        self.execute(CREATE_DELETED_OBJECTS)?;
+        Ok(())
+    }
+
+    fn exec(&self, sql: &str, format: &str) -> Result<Vec<u8>> {
+        let guard = self.conn.lock().unwrap();
+        let output_fmt = output_format_from_str(format)?;
+        let result = guard.query(sql, output_fmt).context("chdb query failed")?;
+        let data = result.data_ref().to_vec();
+
+        debug!(sql = %sql, result_bytes = data.len(), "chdb exec");
+        Ok(data)
+    }
+
+    fn execute(&self, sql: &str) -> Result<()> {
+        self.exec(sql, "TabSeparated")?;
+        Ok(())
+    }
+
+    fn query_str(&self, sql: &str, format: &str) -> Result<String> {
+        let bytes = self.exec(sql, format)?;
+        String::from_utf8(bytes).context("chDB result is not valid UTF-8")
+    }
+
+    /// Create a new bucket.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the bucket to create
+    pub fn bucket_create(&self, name: &str) -> Result<()> {
+        let sql = format!(
+            "INSERT INTO meta.buckets (name, created_at) VALUES ('{}', now64(3))",
+            esc(name)
+        );
+        self.execute(&sql)
+    }
+
+    /// Check if a bucket exists.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the bucket to check
+    ///
+    /// # Returns
+    ///
+    /// `true` if the bucket exists, `false` otherwise
+    pub fn bucket_exists(&self, name: &str) -> Result<bool> {
+        let sql = format!(
+            "SELECT count() FROM meta.buckets WHERE name = '{}'",
+            esc(name)
+        );
+        let result = self.query_str(&sql, "TabSeparated")?;
+        let count: u64 = result.trim().parse().context("parse bucket count")?;
+        Ok(count > 0)
+    }
+
+    /// List all buckets.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `BucketMeta` containing bucket metadata
+    pub fn bucket_list(&self) -> Result<Vec<BucketMeta>> {
+        let sql = "SELECT name, created_at FROM meta.buckets ORDER BY name";
+        let result = self.query_str(sql, "JSONEachRow")?;
+        let mut buckets = Vec::new();
+        for line in result.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(line)?;
+            let name = v["name"].as_str().unwrap_or("").to_string();
+            let ts_str = v["created_at"].as_str().unwrap_or("").to_string();
+            let created_at = parse_datetime64(&ts_str);
+            buckets.push(BucketMeta { name, created_at });
+        }
+        Ok(buckets)
+    }
+
+    /// Delete a bucket.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the bucket to delete
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bucket is not empty
+    pub fn bucket_delete(&self, name: &str) -> Result<()> {
+        let count_sql = format!(
+            "SELECT count() FROM meta.objects FINAL WHERE bucket = '{}' \
+             AND (bucket, key) NOT IN (SELECT bucket, key FROM meta.deleted_objects WHERE bucket = '{}')",
+            esc(name),
+            esc(name)
+        );
+        let result = self.query_str(&count_sql, "TabSeparated")?;
+        let count: u64 = result.trim().parse().context("parse object count")?;
+        if count > 0 {
+            bail!("BucketNotEmpty");
+        }
+
+        let sql = format!(
+            "ALTER TABLE meta.buckets DELETE WHERE name = '{}'",
+            esc(name)
+        );
+        self.execute(&sql)
+    }
+
+    /// Put an object into storage.
+    ///
+    /// # Arguments
+    ///
+    /// * `meta` - The object metadata to store
+    pub fn object_put(&self, meta: &ObjectMeta) -> Result<()> {
+        let del_sql = format!(
+            "ALTER TABLE meta.deleted_objects DELETE WHERE bucket = '{}' AND key = '{}'",
+            esc(&meta.bucket),
+            esc(&meta.key)
+        );
+        self.execute(&del_sql)?;
+
+        let sql = format!(
+            "INSERT INTO meta.objects \
+             (bucket, key, disk_index, size, etag, content_type, last_modified) \
+             VALUES ('{}', '{}', {}, {}, '{}', '{}', now64(3))",
+            esc(&meta.bucket),
+            esc(&meta.key),
+            meta.disk_index,
+            meta.size,
+            esc(&meta.etag),
+            esc(&meta.content_type),
+        );
+        self.execute(&sql)
+    }
+
+    /// Get object metadata.
+    ///
+    /// # Arguments
+    ///
+    /// * `bucket` - The bucket name
+    /// * `key` - The object key
+    ///
+    /// # Returns
+    ///
+    /// `Some(ObjectMeta)` if the object exists, `None` otherwise
+    pub fn object_get(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
+        let sql = format!(
+            "SELECT bucket, key, disk_index, size, etag, content_type, last_modified \
+             FROM meta.objects FINAL \
+             WHERE bucket = '{}' AND key = '{}' \
+             AND (bucket, key) NOT IN \
+               (SELECT bucket, key FROM meta.deleted_objects WHERE bucket = '{}' AND key = '{}') \
+             LIMIT 1",
+            esc(bucket),
+            esc(key),
+            esc(bucket),
+            esc(key)
+        );
+        let result = self.query_str(&sql, "JSONEachRow")?;
+        let line = result.lines().find(|l| !l.trim().is_empty());
+        match line {
+            None => Ok(None),
+            Some(l) => Ok(Some(parse_object_meta(l)?)),
+        }
+    }
+
+    /// Delete an object.
+    ///
+    /// # Arguments
+    ///
+    /// * `bucket` - The bucket name
+    /// * `key` - The object key
+    pub fn object_delete(&self, bucket: &str, key: &str) -> Result<()> {
+        let sql = format!(
+            "INSERT INTO meta.deleted_objects (bucket, key, deleted_at) \
+             VALUES ('{}', '{}', now64(3))",
+            esc(bucket),
+            esc(key)
+        );
+        self.execute(&sql)
+    }
+
+    /// List objects in a bucket.
+    ///
+    /// # Arguments
+    ///
+    /// * `bucket` - The bucket name
+    /// * `prefix` - Optional prefix filter
+    /// * `max_keys` - Maximum number of keys to return
+    /// * `continuation` - Optional continuation token for pagination
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing:
+    /// - A vector of `ObjectMeta` for the objects
+    /// - A boolean indicating if there are more results (is_truncated)
+    pub fn object_list(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        max_keys: u32,
+        continuation: Option<&str>,
+    ) -> Result<(Vec<ObjectMeta>, bool)> {
+        let prefix_clause = match prefix {
+            Some(p) if !p.is_empty() => format!("AND startsWith(key, '{}')", esc(p)),
+            _ => String::new(),
+        };
+        let continuation_clause = match continuation {
+            Some(c) if !c.is_empty() => format!("AND key > '{}'", esc(c)),
+            _ => String::new(),
+        };
+
+        let sql = format!(
+            "SELECT bucket, key, disk_index, size, etag, content_type, last_modified \
+             FROM meta.objects FINAL \
+             WHERE bucket = '{}' \
+             AND (bucket, key) NOT IN \
+               (SELECT bucket, key FROM meta.deleted_objects WHERE bucket = '{}') \
+             {} {} \
+             ORDER BY key \
+             LIMIT {}",
+            esc(bucket),
+            esc(bucket),
+            prefix_clause,
+            continuation_clause,
+            max_keys + 1
+        );
+
+        let result = self.query_str(&sql, "JSONEachRow")?;
+        let mut objects = Vec::new();
+        for line in result.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            objects.push(parse_object_meta(line)?);
+        }
+
+        let is_truncated = objects.len() > max_keys as usize;
+        if is_truncated {
+            objects.truncate(max_keys as usize);
+        }
+
+        Ok((objects, is_truncated))
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Schema initialisation
+// Schema constants
 // ---------------------------------------------------------------------------
 
 const CREATE_DB: &str = "CREATE DATABASE IF NOT EXISTS meta";
@@ -59,8 +354,6 @@ CREATE TABLE IF NOT EXISTS meta.objects (
 ) ENGINE = ReplacingMergeTree(last_modified)
 ORDER BY (bucket, key)";
 
-// Soft-delete log – used so that ListObjects can reflect deletes promptly
-// before the ReplacingMergeTree background merge runs.
 const CREATE_DELETED_OBJECTS: &str = "
 CREATE TABLE IF NOT EXISTS meta.deleted_objects (
     bucket      String,
@@ -68,14 +361,6 @@ CREATE TABLE IF NOT EXISTS meta.deleted_objects (
     deleted_at  DateTime64(3, 'UTC')
 ) ENGINE = MergeTree()
 ORDER BY (bucket, key)";
-
-pub fn init_schema(conn: &Mutex<Connection>) -> Result<()> {
-    conn_execute(conn, CREATE_DB)?;
-    conn_execute(conn, CREATE_BUCKETS)?;
-    conn_execute(conn, CREATE_OBJECTS)?;
-    conn_execute(conn, CREATE_DELETED_OBJECTS)?;
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Metadata types
@@ -99,12 +384,35 @@ pub struct ObjectMeta {
 }
 
 // ---------------------------------------------------------------------------
-// Bucket operations
+// Legacy compatibility functions (for backward compatibility)
 // ---------------------------------------------------------------------------
 
-/// Escape a string for inclusion inside a ClickHouse single-quoted literal.
-fn esc(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
+fn conn_exec(conn: &Mutex<Connection>, sql: &str, format: &str) -> Result<Vec<u8>> {
+    let guard = conn.lock().unwrap();
+    let output_fmt = output_format_from_str(format)?;
+    let result = guard.query(sql, output_fmt).context("chdb query failed")?;
+    let data = result.data_ref().to_vec();
+
+    debug!(sql = %sql, result_bytes = data.len(), "chdb exec");
+    Ok(data)
+}
+
+fn conn_execute(conn: &Mutex<Connection>, sql: &str) -> Result<()> {
+    conn_exec(conn, sql, "TabSeparated")?;
+    Ok(())
+}
+
+fn conn_query_str(conn: &Mutex<Connection>, sql: &str, format: &str) -> Result<String> {
+    let bytes = conn_exec(conn, sql, format)?;
+    String::from_utf8(bytes).context("chDB result is not valid UTF-8")
+}
+
+pub fn init_schema(conn: &Mutex<Connection>) -> Result<()> {
+    conn_execute(conn, CREATE_DB)?;
+    conn_execute(conn, CREATE_BUCKETS)?;
+    conn_execute(conn, CREATE_OBJECTS)?;
+    conn_execute(conn, CREATE_DELETED_OBJECTS)?;
+    Ok(())
 }
 
 pub fn bucket_create(conn: &Mutex<Connection>, name: &str) -> Result<()> {
@@ -137,7 +445,6 @@ pub fn bucket_list(conn: &Mutex<Connection>) -> Result<Vec<BucketMeta>> {
         let v: serde_json::Value = serde_json::from_str(line)?;
         let name = v["name"].as_str().unwrap_or("").to_string();
         let ts_str = v["created_at"].as_str().unwrap_or("").to_string();
-        // chDB returns DateTime64 as "YYYY-MM-DD HH:MM:SS.mmm"
         let created_at = parse_datetime64(&ts_str);
         buckets.push(BucketMeta { name, created_at });
     }
@@ -145,7 +452,6 @@ pub fn bucket_list(conn: &Mutex<Connection>) -> Result<Vec<BucketMeta>> {
 }
 
 pub fn bucket_delete(conn: &Mutex<Connection>, name: &str) -> Result<()> {
-    // First check if bucket is empty
     let count_sql = format!(
         "SELECT count() FROM meta.objects FINAL WHERE bucket = '{}' \
          AND (bucket, key) NOT IN (SELECT bucket, key FROM meta.deleted_objects WHERE bucket = '{}')",
@@ -165,12 +471,7 @@ pub fn bucket_delete(conn: &Mutex<Connection>, name: &str) -> Result<()> {
     conn_execute(conn, &sql)
 }
 
-// ---------------------------------------------------------------------------
-// Object operations
-// ---------------------------------------------------------------------------
-
 pub fn object_put(conn: &Mutex<Connection>, meta: &ObjectMeta) -> Result<()> {
-    // Remove any pending delete entry first
     let del_sql = format!(
         "ALTER TABLE meta.deleted_objects DELETE WHERE bucket = '{}' AND key = '{}'",
         esc(&meta.bucket),
@@ -274,8 +575,12 @@ pub fn object_list(
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Helper functions
 // ---------------------------------------------------------------------------
+
+fn esc(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'")
+}
 
 fn parse_object_meta(json_line: &str) -> Result<ObjectMeta> {
     let v: serde_json::Value = serde_json::from_str(json_line)?;
@@ -294,8 +599,6 @@ fn parse_object_meta(json_line: &str) -> Result<ObjectMeta> {
 }
 
 fn parse_datetime64(s: &str) -> DateTime<Utc> {
-    // chDB returns DateTime64 in format "YYYY-MM-DD HH:MM:SS.mmm"
-    // Try a few formats.
     let formats = [
         "%Y-%m-%d %H:%M:%S%.f",
         "%Y-%m-%dT%H:%M:%S%.f",
@@ -309,10 +612,6 @@ fn parse_datetime64(s: &str) -> DateTime<Utc> {
     Utc::now()
 }
 
-/// Translate configured format strings to chdb-rust output formats.
-///
-/// Supported values are `"JSONEachRow"` and `"TabSeparated"`.
-/// Any other format string returns an error to avoid silently changing behavior.
 fn output_format_from_str(format: &str) -> Result<OutputFormat> {
     match format {
         "JSONEachRow" => Ok(OutputFormat::JSONEachRow),
@@ -328,8 +627,6 @@ fn output_format_from_str(format: &str) -> Result<OutputFormat> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- esc ---
 
     #[test]
     fn esc_plain_string() {
@@ -350,8 +647,6 @@ mod tests {
     fn esc_combined() {
         assert_eq!(esc("a\\'b"), "a\\\\\\'b");
     }
-
-    // --- parse_datetime64 ---
 
     #[test]
     fn parse_datetime64_space_format() {
@@ -396,8 +691,6 @@ mod tests {
     fn output_format_unknown_rejected() {
         assert!(output_format_from_str("UnknownFormat").is_err());
     }
-
-    // --- parse_object_meta ---
 
     #[test]
     fn parse_object_meta_valid() {
