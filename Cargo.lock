@@ -786,7 +786,6 @@ dependencies = [
  "pin-utils",
  "smallvec",
  "tokio",
- "want",
 ]
 
 [[package]]
@@ -1498,14 +1497,12 @@ dependencies = [
  "chrono",
  "futures",
  "hex",
- "hyper 1.8.1",
  "hyper-util",
  "md-5 0.10.6",
  "s3s",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "toml",
  "tracing",

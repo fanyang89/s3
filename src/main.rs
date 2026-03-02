@@ -24,18 +24,11 @@ use crate::storage::JbodStorage;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // ---------------------------------------------------------------------------
-    // Logging
-    // ---------------------------------------------------------------------------
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-
-    // ---------------------------------------------------------------------------
-    // Configuration
-    // ---------------------------------------------------------------------------
     let cfg = match std::env::args().nth(1) {
         Some(path) => Config::from_file(&path)
             .with_context(|| format!("failed to load config from {path}"))?,
