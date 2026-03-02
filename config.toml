@@ -10,3 +10,11 @@ path = "/tmp/s3-data0"
 
 [[directories]]
 path = "/tmp/s3-data1"
+
+[[auth.credentials]]
+access_key = "admin"
+secret_key = "password123"
+
+[[auth.credentials]]
+access_key = "test"
+secret_key = "testtest"

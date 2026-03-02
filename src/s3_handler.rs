@@ -3,17 +3,18 @@
 //! Implements the `s3s::S3` trait by delegating to our JBOD storage engine
 //! (for data I/O) and chDB metadata layer (for bucket/object metadata).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use chdb_rust::connection::Connection;
 use futures::TryStreamExt;
 use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result, s3_error};
 use tracing::{error, info};
 
 use crate::metadata::{
-    BucketMeta, ChdbConn, ObjectMeta, bucket_create, bucket_delete, bucket_exists, bucket_list,
+    BucketMeta, ObjectMeta, bucket_create, bucket_delete, bucket_exists, bucket_list,
     object_delete, object_get, object_list, object_put,
 };
 use crate::storage::JbodStorage;
@@ -23,7 +24,7 @@ use crate::storage::JbodStorage;
 // ---------------------------------------------------------------------------
 
 pub struct StorageHandler {
-    pub db: Arc<ChdbConn>,
+    pub db: Arc<Mutex<Connection>>,
     pub storage: Arc<JbodStorage>,
 }
 
@@ -130,82 +131,37 @@ impl s3s::S3 for StorageHandler {
         Ok(S3Response::new(DeleteBucketOutput {}))
     }
 
-    async fn list_buckets(
+    async fn delete_object(
         &self,
-        _req: S3Request<ListBucketsInput>,
-    ) -> S3Result<S3Response<ListBucketsOutput>> {
-        info!("ListBuckets");
+        req: S3Request<DeleteObjectInput>,
+    ) -> S3Result<S3Response<DeleteObjectOutput>> {
+        let bucket = req.input.bucket.as_str();
+        let key = req.input.key.as_str();
+        info!(bucket, key, "DeleteObject");
 
-        let metas: Vec<BucketMeta> =
-            bucket_list(&self.db).map_err(|e| s3_error!(InternalError, "metadata error: {e}"))?;
+        // Look up disk_index before deleting metadata
+        let meta_opt = object_get(&self.db, bucket, key)
+            .map_err(|e| s3_error!(InternalError, "metadata error: {e}"))?;
 
-        let buckets: Vec<Bucket> = metas
-            .into_iter()
-            .map(|m| Bucket {
-                name: Some(BucketName::from(m.name.as_str())),
-                creation_date: Some(to_timestamp(m.created_at)),
-                bucket_region: None,
-            })
-            .collect();
-
-        let output = ListBucketsOutput {
-            buckets: Some(buckets),
-            owner: None,
-            continuation_token: None,
-            prefix: None,
-        };
-        Ok(S3Response::new(output))
+        if let Some(meta) = meta_opt {
+            object_delete(&self.db, bucket, key)
+                .map_err(|e| s3_error!(InternalError, "metadata error: {e}"))?;
+            // Best-effort file delete; ignore not-found
+            if let Err(e) = self.storage.delete(meta.disk_index, bucket, key).await {
+                error!(bucket, key, error = %e, "failed to delete object file (metadata already removed)");
+            }
+        }
+        // S3 spec: delete is idempotent; no error if key didn't exist.
+        Ok(S3Response::new(DeleteObjectOutput {
+            delete_marker: None,
+            request_charged: None,
+            version_id: None,
+        }))
     }
 
     // ------------------------------------------------------------------
     // Object operations
     // ------------------------------------------------------------------
-
-    async fn put_object(
-        &self,
-        req: S3Request<PutObjectInput>,
-    ) -> S3Result<S3Response<PutObjectOutput>> {
-        let bucket = req.input.bucket.as_str();
-        let key = req.input.key.as_str();
-        let content_type = req
-            .input
-            .content_type
-            .as_deref()
-            .unwrap_or("application/octet-stream")
-            .to_owned();
-        info!(bucket, key, "PutObject");
-
-        if !bucket_exists(&self.db, bucket)
-            .map_err(|e| s3_error!(InternalError, "metadata error: {e}"))?
-        {
-            return Err(s3_error!(NoSuchBucket, "bucket {bucket} does not exist"));
-        }
-
-        let data = collect_blob(req.input.body).await?;
-
-        let (disk_index, etag) = self
-            .storage
-            .put(bucket, key, &data)
-            .await
-            .map_err(|e| s3_error!(InternalError, "storage error: {e}"))?;
-
-        let meta = ObjectMeta {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            disk_index,
-            size: data.len() as u64,
-            etag: etag.clone(),
-            content_type,
-            last_modified: chrono::Utc::now(),
-        };
-        object_put(&self.db, &meta).map_err(|e| s3_error!(InternalError, "metadata error: {e}"))?;
-
-        let output = PutObjectOutput {
-            e_tag: Some(wrap_etag(&etag)),
-            ..Default::default()
-        };
-        Ok(S3Response::new(output))
-    }
 
     async fn get_object(
         &self,
@@ -241,34 +197,6 @@ impl s3s::S3 for StorageHandler {
         Ok(S3Response::new(output))
     }
 
-    async fn delete_object(
-        &self,
-        req: S3Request<DeleteObjectInput>,
-    ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        let bucket = req.input.bucket.as_str();
-        let key = req.input.key.as_str();
-        info!(bucket, key, "DeleteObject");
-
-        // Look up disk_index before deleting metadata
-        let meta_opt = object_get(&self.db, bucket, key)
-            .map_err(|e| s3_error!(InternalError, "metadata error: {e}"))?;
-
-        if let Some(meta) = meta_opt {
-            object_delete(&self.db, bucket, key)
-                .map_err(|e| s3_error!(InternalError, "metadata error: {e}"))?;
-            // Best-effort file delete; ignore not-found
-            if let Err(e) = self.storage.delete(meta.disk_index, bucket, key).await {
-                error!(bucket, key, error = %e, "failed to delete object file (metadata already removed)");
-            }
-        }
-        // S3 spec: delete is idempotent; no error if key didn't exist.
-        Ok(S3Response::new(DeleteObjectOutput {
-            delete_marker: None,
-            request_charged: None,
-            version_id: None,
-        }))
-    }
-
     async fn head_object(
         &self,
         req: S3Request<HeadObjectInput>,
@@ -287,6 +215,33 @@ impl s3s::S3 for StorageHandler {
             e_tag: Some(wrap_etag(&meta.etag)),
             last_modified: Some(to_timestamp(meta.last_modified)),
             ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
+    async fn list_buckets(
+        &self,
+        _req: S3Request<ListBucketsInput>,
+    ) -> S3Result<S3Response<ListBucketsOutput>> {
+        info!("ListBuckets");
+
+        let metas: Vec<BucketMeta> =
+            bucket_list(&self.db).map_err(|e| s3_error!(InternalError, "metadata error: {e}"))?;
+
+        let buckets: Vec<Bucket> = metas
+            .into_iter()
+            .map(|m| Bucket {
+                name: Some(BucketName::from(m.name.as_str())),
+                creation_date: Some(to_timestamp(m.created_at)),
+                bucket_region: None,
+            })
+            .collect();
+
+        let output = ListBucketsOutput {
+            buckets: Some(buckets),
+            owner: None,
+            continuation_token: None,
+            prefix: None,
         };
         Ok(S3Response::new(output))
     }
@@ -402,6 +357,52 @@ impl s3s::S3 for StorageHandler {
             encoding_type: None,
             start_after: req.input.start_after,
             request_charged: None,
+        };
+        Ok(S3Response::new(output))
+    }
+
+    async fn put_object(
+        &self,
+        req: S3Request<PutObjectInput>,
+    ) -> S3Result<S3Response<PutObjectOutput>> {
+        let bucket = req.input.bucket.as_str();
+        let key = req.input.key.as_str();
+        let content_type = req
+            .input
+            .content_type
+            .as_deref()
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        info!(bucket, key, "PutObject");
+
+        if !bucket_exists(&self.db, bucket)
+            .map_err(|e| s3_error!(InternalError, "metadata error: {e}"))?
+        {
+            return Err(s3_error!(NoSuchBucket, "bucket {bucket} does not exist"));
+        }
+
+        let data = collect_blob(req.input.body).await?;
+
+        let (disk_index, etag) = self
+            .storage
+            .put(bucket, key, &data)
+            .await
+            .map_err(|e| s3_error!(InternalError, "storage error: {e}"))?;
+
+        let meta = ObjectMeta {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            disk_index,
+            size: data.len() as u64,
+            etag: etag.clone(),
+            content_type,
+            last_modified: chrono::Utc::now(),
+        };
+        object_put(&self.db, &meta).map_err(|e| s3_error!(InternalError, "metadata error: {e}"))?;
+
+        let output = PutObjectOutput {
+            e_tag: Some(wrap_etag(&etag)),
+            ..Default::default()
         };
         Ok(S3Response::new(output))
     }
